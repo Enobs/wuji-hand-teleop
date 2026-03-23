@@ -10,9 +10,9 @@ safety_margin: 0.03  # 3cm (matches Franka default safety_distance)
 
 # Dual-arm setup
 dual_arm:
-  spacing: 0.06  # 60mm between arm bases (along Y axis)
-  left_base_offset: [0.0, 0.03, 0.0]   # +30mm Y
-  right_base_offset: [0.0, -0.03, 0.0]  # -30mm Y
+  spacing: 0.60  # 600mm between arm bases (along Y axis)
+  left_base_offset: [0.0, 0.30, 0.0]   # +300mm Y
+  right_base_offset: [0.0, -0.30, 0.0]  # -300mm Y
 
 # FR3 kinematics (from fr3/kinematics.yaml)
 fr3_kinematics:

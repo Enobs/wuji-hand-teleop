@@ -1,11 +1,11 @@
 """
 Collision Manager ROS2 Node
 
-Subscribes to joint states, checks collision at 100Hz,
-publishes collision state and safe projected poses.
+Uses URDF collision meshes (STL) with FCL for accurate real-time
+collision detection. Reads link transforms from TF tree.
 
-Can run standalone with simulated joints for testing
-(use joint_state_publisher_gui).
+Usage:
+    ros2 run collision_manager collision_manager
 """
 from __future__ import annotations
 
@@ -20,18 +20,23 @@ from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Bool, ColorRGBA
 from std_srvs.srv import SetBool
-from geometry_msgs.msg import Point, Vector3, Pose, Quaternion
+from geometry_msgs.msg import Vector3, Quaternion, Point
 from visualization_msgs.msg import Marker, MarkerArray
-
-from .collision_checker import CollisionChecker, CapsuleDef, CollisionResult
-from .fr3_kinematics import fr3_forward_kinematics, FR3_HOME_JOINTS, check_joint_limits
 
 import tf2_ros
 from tf2_ros import TransformException
+from scipy.spatial.transform import Rotation as R
+
+from .mesh_collision_checker import MeshCollisionChecker, CollisionResult
+
+
+# FR3 link names in URDF TF tree
+FR3_LINKS = ["fr3_link0", "fr3_link1", "fr3_link2", "fr3_link3",
+             "fr3_link4", "fr3_link5", "fr3_link6", "fr3_link7", "fr3_link8"]
 
 
 class CollisionManagerNode(Node):
-    """Real-time collision detection node for dual-arm teleoperation."""
+    """Mesh-based collision detection node for dual-arm teleoperation."""
 
     def __init__(self):
         super().__init__("collision_manager")
@@ -39,342 +44,199 @@ class CollisionManagerNode(Node):
         # Load config
         config_path = self._find_config()
         self.config = self._load_config(config_path)
+        self.get_logger().info(f"Config: {config_path}")
 
-        self.get_logger().info(f"Loaded config from: {config_path}")
+        safety_margin = self.config.get("safety_margin", 0.03)
 
-        # Initialize collision checker
-        self.checker = CollisionChecker(
-            safety_margin=self.config.get("safety_margin", 0.02),
-            exclude_pairs=self._build_exclude_pairs(),
+        # Build exclude pairs
+        exclude = self._build_exclude_pairs()
+
+        # Initialize mesh collision checker
+        self.checker = MeshCollisionChecker(
+            safety_margin=safety_margin,
+            exclude_pairs=exclude,
         )
 
-        # Register collision bodies
-        self._register_franka_bodies("left")
-        self._register_franka_bodies("right")
-        self._register_hand_bodies()
-        self._register_environment()
+        # Find mesh directory
+        self._mesh_dir = self._find_mesh_dir()
+        self.get_logger().info(f"Mesh dir: {self._mesh_dir}")
 
-        # QoS
-        qos = QoSProfile(
-            reliability=QoSReliabilityPolicy.BEST_EFFORT,
-            history=QoSHistoryPolicy.KEEP_LAST,
-            depth=1,
-        )
+        # Load meshes for both arms
+        self._load_arm_meshes("left")
+        self._load_arm_meshes("right")
+
+        # Load environment
+        self._load_environment()
+
+        # TF
+        self._tf_buffer = tf2_ros.Buffer()
+        self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
+        self._base_frame = "world"
 
         # Publishers
         self.collision_pub = self.create_publisher(Bool, "/collision_state", 10)
         self.marker_pub = self.create_publisher(MarkerArray, "/collision_markers", 10)
 
-        # Subscribers - joint states from both arms
-        self.create_subscription(
-            JointState, "/franka_left/joint_states",
-            self._left_joint_cb, qos)
-        self.create_subscription(
-            JointState, "/franka_right/joint_states",
-            self._right_joint_cb, qos)
-        # Also accept simulated joint states (for testing without hardware)
-        self.create_subscription(
-            JointState, "/joint_states",
-            self._sim_joint_cb, qos)
-
-        # Service to enable/disable
+        # Service
         self._enabled = True
-        self.create_service(
-            SetBool, "/collision/enable", self._enable_cb)
-
-        # State (default to FR3 home position)
-        self._left_joints: Optional[np.ndarray] = FR3_HOME_JOINTS.copy()
-        self._right_joints: Optional[np.ndarray] = FR3_HOME_JOINTS.copy()
-
-        # TF listener - use TF from robot_state_publisher when available
-        self._tf_buffer = tf2_ros.Buffer()
-        self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
-        self._use_tf = True  # prefer TF over FK
-        self._tf_base_frame = "world"
-        # FR3 link names in URDF
-        self._fr3_link_names = [
-            "fr3_link0", "fr3_link1", "fr3_link2", "fr3_link3",
-            "fr3_link4", "fr3_link5", "fr3_link6", "fr3_link7",
-            "fr3_link8",
-        ]
-        self._last_result: Optional[CollisionResult] = None
+        self.create_service(SetBool, "/collision/enable", self._enable_cb)
 
         # Timer
         rate = self.config.get("check_rate_hz", 100.0)
         self.create_timer(1.0 / rate, self._check_loop)
 
         body_count = len(self.checker.bodies)
-        env_count = len(self.checker.env_objects)
+        env_count = len(self.checker.env_bodies)
+        total_faces = sum(b.face_count for b in self.checker.bodies.values())
         self.get_logger().info(
-            f"Collision manager ready: {body_count} bodies, "
-            f"{env_count} env objects, {rate}Hz"
+            f"Ready: {body_count} bodies ({total_faces} faces total), "
+            f"{env_count} env, {rate}Hz, margin={safety_margin}m"
         )
 
     def _find_config(self) -> str:
-        """Find collision config file."""
-        # Try package share directory first
         try:
             from ament_index_python.packages import get_package_share_directory
-            share = Path(get_package_share_directory("collision_manager"))
-            path = share / "config" / "collision_config.yaml"
-            if path.exists():
-                return str(path)
+            p = Path(get_package_share_directory("collision_manager")) / "config" / "collision_config.yaml"
+            if p.exists():
+                return str(p)
         except Exception:
             pass
-
-        # Fallback: relative to source
-        src_path = Path(__file__).parent.parent / "config" / "collision_config.yaml"
-        if src_path.exists():
-            return str(src_path)
-
-        self.get_logger().warn("Config not found, using defaults")
-        return ""
+        p = Path(__file__).parent.parent / "config" / "collision_config.yaml"
+        return str(p) if p.exists() else ""
 
     def _load_config(self, path: str) -> dict:
         if not path:
             return {}
-        with open(path, 'r') as f:
+        with open(path) as f:
             return yaml.safe_load(f) or {}
 
-    def _build_exclude_pairs(self) -> List:
-        """Build exclude pairs with arm prefixes.
+    def _find_mesh_dir(self) -> Path:
+        """Find FR3 collision mesh directory."""
+        # Try package share
+        try:
+            from ament_index_python.packages import get_package_share_directory
+            d = Path(get_package_share_directory("franka_description"))
+            mesh_dir = d / "meshes" / "robots" / "fr3" / "collision"
+            if mesh_dir.exists():
+                return mesh_dir
+        except Exception:
+            pass
+        # Try source
+        src = Path(__file__).parent.parent.parent.parent / "franka_description" / "meshes" / "robots" / "fr3" / "collision"
+        if src.exists():
+            return src
+        self.get_logger().error("FR3 collision mesh directory not found!")
+        return Path(".")
 
-        Also auto-excludes all same-arm pairs that are within 2 links
-        of each other (can't physically collide).
-        """
-        raw = self.config.get("exclude_pairs", [])
-        pairs = []
-        for a, b in raw:
-            pairs.append((f"left_{a}", f"left_{b}"))
-            pairs.append((f"right_{a}", f"right_{b}"))
-
-        # Auto-exclude same-arm links within 2 steps (physically impossible)
-        link_names = ["link0", "link1", "link2", "link3",
-                      "link4", "link5", "link6", "link7", "hand"]
-        for side in ["left", "right"]:
-            for i in range(len(link_names)):
-                for j in range(i + 1, min(i + 3, len(link_names))):
-                    a = f"{side}_{link_names[i]}"
-                    b = f"{side}_{link_names[j]}"
-                    pairs.append((a, b))
-                    for suffix_a in ["", "_0", "_1"]:
-                        for suffix_b in ["", "_0", "_1"]:
-                            pairs.append((a + suffix_a, b + suffix_b))
-
-        # Exclude cross-arm base links (fixed, always overlapping due to spacing)
-        pairs.append(("left_link0", "right_link0"))
-        pairs.append(("left_link0", "right_link1"))
-        pairs.append(("right_link0", "left_link1"))
-
-        return pairs
-
-    def _register_franka_bodies(self, side: str):
-        """Register capsule bodies for one Franka arm."""
-        capsules = self.config.get("franka_capsules", {})
-        self._capsule_offsets = getattr(self, '_capsule_offsets', {})
-
-        for link_name, params in capsules.items():
-            if isinstance(params, list):
-                for i, p in enumerate(params):
-                    name = f"{side}_{link_name}_{i}" if len(params) > 1 else f"{side}_{link_name}"
-                    cap = CapsuleDef(radius=p["radius"], length=p["length"])
-                    self.checker.add_body(name, cap)
-                    # Store local offset for transform computation
-                    self._capsule_offsets[name] = {
-                        "link": link_name,
-                        "xyz": p.get("xyz", [0, 0, 0]),
-                    }
+    def _load_arm_meshes(self, side: str):
+        """Load collision meshes for one FR3 arm."""
+        loaded = 0
+        for i in range(8):
+            stl = self._mesh_dir / f"link{i}.stl"
+            name = f"{side}_link{i}"
+            if self.checker.add_mesh_body(name, str(stl)):
+                loaded += 1
             else:
-                name = f"{side}_{link_name}"
-                cap = CapsuleDef(radius=params["radius"], length=params["length"])
-                self.checker.add_body(name, cap)
-                self._capsule_offsets[name] = {
-                    "link": link_name,
-                    "xyz": params.get("xyz", [0, 0, 0]),
-                }
+                self.get_logger().warn(f"Mesh not found: {stl}")
+        self.get_logger().info(f"{side} arm: {loaded}/8 meshes loaded")
 
-    def _register_hand_bodies(self):
-        """Register Wuji Hand collision bodies (right hand only for now)."""
-        capsules = self.config.get("wuji_hand_capsules", {})
-        for link_name, params in capsules.items():
-            name = f"right_hand_{link_name}"
-            cap = CapsuleDef(
-                radius=params["radius"],
-                length=params["length"],
-            )
-            self.checker.add_body(name, cap)
-
-    def _register_environment(self):
-        """Register static environment obstacles."""
+    def _load_environment(self):
+        """Load environment obstacles from config."""
         env = self.config.get("environment", {})
         for name, obj in env.items():
             if obj.get("type") == "box":
-                self.checker.add_box_obstacle(
-                    name,
-                    obj["size"],
-                    obj["position"],
-                )
-                self.get_logger().info(f"Added environment: {name} (box)")
+                self.checker.add_box_obstacle(name, obj["size"], obj["position"])
+                self.get_logger().info(f"Environment: {name}")
 
-    def _left_joint_cb(self, msg: JointState):
-        if msg.position:
-            self._left_joints = np.array(msg.position)
+    def _build_exclude_pairs(self) -> set:
+        """Build exclude pairs for same-arm adjacent/near links."""
+        pairs = set()
+        for side in ["left", "right"]:
+            # Adjacent links (within 2 steps) on same arm
+            for i in range(8):
+                for j in range(i + 1, min(i + 3, 8)):
+                    pairs.add((f"{side}_link{i}", f"{side}_link{j}"))
 
-    def _right_joint_cb(self, msg: JointState):
-        if msg.position:
-            self._right_joints = np.array(msg.position)
+        # Cross-arm: exclude link0 with everything on the other arm (base is fixed)
+        for i in range(8):
+            pairs.add((f"left_link0", f"right_link{i}"))
+            pairs.add((f"right_link0", f"left_link{i}"))
+        # Also exclude link1 cross-arm with nearby links
+        for i in range(3):
+            pairs.add((f"left_link1", f"right_link{i}"))
+            pairs.add((f"right_link1", f"left_link{i}"))
 
-    def _sim_joint_cb(self, msg: JointState):
-        """Accept /joint_states for simulation testing."""
-        if msg.position:
-            joints = np.array(msg.position)
-            n = len(joints)
-            if n >= 14:
-                self._left_joints = joints[:7]
-                self._right_joints = joints[7:14]
-            elif n >= 7:
-                # Single arm: use same joints for both arms (testing)
-                self._left_joints = joints[:7]
-                self._right_joints = joints[:7]
+        # Base links vs table (mounted on table, always touching)
+        for side in ["left", "right"]:
+            pairs.add((f"{side}_link0", "table"))
+            pairs.add((f"{side}_link1", "table"))
+
+        return pairs
+
+    def _get_tf(self, frame: str) -> Optional[np.ndarray]:
+        """Get 4x4 transform from TF."""
+        try:
+            t = self._tf_buffer.lookup_transform(
+                self._base_frame, frame,
+                rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=0.01))
+            T = np.eye(4)
+            T[0, 3] = t.transform.translation.x
+            T[1, 3] = t.transform.translation.y
+            T[2, 3] = t.transform.translation.z
+            q = t.transform.rotation
+            T[:3, :3] = R.from_quat([q.x, q.y, q.z, q.w]).as_matrix()
+            return T
+        except TransformException:
+            return None
+
+    def _update_arm_from_tf(self, side: str, tf_prefix: str = ""):
+        """Update collision body transforms from TF tree."""
+        for i in range(8):
+            tf_frame = f"{tf_prefix}fr3_link{i}"
+            body_name = f"{side}_link{i}"
+            T = self._get_tf(tf_frame)
+            if T is not None:
+                self.checker.update_body_transform(body_name, T)
 
     def _enable_cb(self, request, response):
         self._enabled = request.data
         response.success = True
-        response.message = f"Collision checking {'enabled' if self._enabled else 'disabled'}"
-        self.get_logger().info(response.message)
+        response.message = f"Collision {'enabled' if self._enabled else 'disabled'}"
         return response
 
-    def _joints_to_transforms(
-        self, side: str, joints: np.ndarray
-    ) -> Dict[str, np.ndarray]:
-        """Convert joint angles to link transforms using FR3 FK.
-
-        Uses official FR3 kinematics parameters from fr3/kinematics.yaml.
-        """
-        base_offset = self.config.get("dual_arm", {})
-        offset = np.array(
-            base_offset.get(f"{side}_base_offset", [0, 0, 0])
-        )
-
-        base_T = np.eye(4)
-        base_T[:3, 3] = offset
-
-        # Ensure we have exactly 7 joints
-        q = np.zeros(7)
-        q[:min(len(joints), 7)] = joints[:7]
-
-        return fr3_forward_kinematics(q, base_transform=base_T)
-
-    def _get_transforms_from_tf(self, prefix: str = "") -> Optional[Dict[str, np.ndarray]]:
-        """Get link transforms from TF tree (published by robot_state_publisher)."""
-        transforms = {}
-        # Map our internal names to URDF link names
-        link_map = {
-            "link0": f"{prefix}fr3_link0",
-            "link1": f"{prefix}fr3_link1",
-            "link2": f"{prefix}fr3_link2",
-            "link3": f"{prefix}fr3_link3",
-            "link4": f"{prefix}fr3_link4",
-            "link5": f"{prefix}fr3_link5",
-            "link6": f"{prefix}fr3_link6",
-            "link7": f"{prefix}fr3_link7",
-            "hand":  f"{prefix}fr3_link8",
-        }
-
-        for our_name, tf_name in link_map.items():
-            try:
-                t = self._tf_buffer.lookup_transform(
-                    self._tf_base_frame, tf_name,
-                    rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=0.01))
-
-                T = np.eye(4)
-                T[0, 3] = t.transform.translation.x
-                T[1, 3] = t.transform.translation.y
-                T[2, 3] = t.transform.translation.z
-
-                q = t.transform.rotation
-                from scipy.spatial.transform import Rotation as R
-                T[:3, :3] = R.from_quat([q.x, q.y, q.z, q.w]).as_matrix()
-
-                transforms[our_name] = T
-            except TransformException:
-                return None  # TF not ready
-
-        return transforms
-
-    def _update_capsule_transforms(self, side: str, link_transforms: Dict):
-        """Update all capsule body transforms, applying local offsets."""
-        for body_name, offset_info in self._capsule_offsets.items():
-            if not body_name.startswith(side):
-                continue
-            link_name = offset_info["link"]
-            if link_name not in link_transforms:
-                continue
-
-            T_link = link_transforms[link_name]
-            xyz = offset_info["xyz"]
-
-            # Apply local offset in link frame
-            T_capsule = T_link.copy()
-            T_capsule[:3, 3] += T_link[:3, :3] @ np.array(xyz)
-
-            self.checker.update_body_transform(body_name, T_capsule)
-
     def _check_loop(self):
-        """Main collision check loop at configured rate."""
+        """Main loop: update transforms, check collision, publish."""
         if not self._enabled:
             return
 
-        # Try TF first (from robot_state_publisher), fallback to FK
-        tf_transforms = self._get_transforms_from_tf() if self._use_tf else None
+        # Update from TF (dual-arm: left_fr3_linkX / right_fr3_linkX)
+        self._update_arm_from_tf("left", tf_prefix="left_")
+        self._update_arm_from_tf("right", tf_prefix="right_")
 
-        if tf_transforms is not None:
-            # Use TF for left arm (single arm mode: same for both)
-            self._update_capsule_transforms("left", tf_transforms)
-            self._update_capsule_transforms("right", tf_transforms)
-        else:
-            # Fallback to FK from joint states
-            if self._left_joints is not None:
-                transforms = self._joints_to_transforms("left", self._left_joints)
-                self._update_capsule_transforms("left", transforms)
-
-            if self._right_joints is not None:
-                transforms = self._joints_to_transforms("right", self._right_joints)
-                self._update_capsule_transforms("right", transforms)
-
-        # Run collision check
+        # Check collision
         result = self.checker.check_collision()
-        self._last_result = result
 
-        # Publish collision state
+        # Publish bool
         msg = Bool()
         msg.data = result.is_colliding
         self.collision_pub.publish(msg)
 
-        # Publish visualization markers
+        # Publish markers
         self._publish_markers(result)
 
-        # Log warnings
+        # Log
         if result.is_colliding:
             self.get_logger().warn(
                 f"COLLISION: {result.closest_pair[0]} <-> {result.closest_pair[1]} "
                 f"dist={result.min_distance:.4f}m ({result.num_collisions} pairs)",
-                throttle_duration_sec=1.0,
-            )
-        else:
-            self.get_logger().debug(
-                f"Safe: min_dist={result.min_distance:.4f}m "
-                f"closest={result.closest_pair}",
-                throttle_duration_sec=5.0,
-            )
-
+                throttle_duration_sec=1.0)
 
     def _publish_markers(self, result: CollisionResult):
-        """Publish collision capsules as RViz markers."""
+        """Publish collision mesh bounding boxes as markers for RViz."""
         ma = MarkerArray()
         stamp = self.get_clock().now().to_msg()
 
-        # Colliding body names for coloring
         colliding_names = set()
         for a, b, d in result.details:
             if d < 0:
@@ -385,36 +247,40 @@ class CollisionManagerNode(Node):
             m = Marker()
             m.header.frame_id = "world"
             m.header.stamp = stamp
-            m.ns = "collision_capsules"
+            m.ns = "collision_mesh"
             m.id = idx
-            m.type = Marker.CYLINDER
-            m.action = Marker.ADD
+            m.type = Marker.MESH_RESOURCE
+
+            # Use the STL file as mesh resource
+            # Find the link number from name (e.g., "left_link3" -> 3)
+            link_num = name.split("_link")[-1]
+            mesh_path = self._mesh_dir / f"link{link_num}.stl"
+            if mesh_path.exists():
+                m.mesh_resource = f"file://{mesh_path}"
+            else:
+                m.type = Marker.CUBE
+                m.scale = Vector3(x=0.05, y=0.05, z=0.05)
 
             T = body.transform
             pos = T[:3, 3]
             m.pose.position = Point(x=float(pos[0]), y=float(pos[1]), z=float(pos[2]))
 
-            # Extract quaternion from rotation matrix
-            from scipy.spatial.transform import Rotation as R
-            quat = R.from_matrix(T[:3, :3]).as_quat()  # [x,y,z,w]
+            quat = R.from_matrix(T[:3, :3]).as_quat()
             m.pose.orientation = Quaternion(
                 x=float(quat[0]), y=float(quat[1]),
                 z=float(quat[2]), w=float(quat[3]))
 
-            r = body.capsule.radius
-            l = body.capsule.length
-            m.scale = Vector3(x=r * 2, y=r * 2, z=l)
+            m.scale = Vector3(x=1.0, y=1.0, z=1.0)
 
-            # Green = safe, Red = colliding
             if name in colliding_names:
                 m.color = ColorRGBA(r=1.0, g=0.0, b=0.0, a=0.5)
             elif name.startswith("left"):
-                m.color = ColorRGBA(r=0.0, g=0.7, b=0.3, a=0.3)
+                m.color = ColorRGBA(r=0.0, g=0.8, b=0.3, a=0.3)
             else:
-                m.color = ColorRGBA(r=0.3, g=0.3, b=0.7, a=0.3)
+                m.color = ColorRGBA(r=0.3, g=0.3, b=0.8, a=0.3)
 
             m.lifetime.sec = 0
-            m.lifetime.nanosec = 200000000  # 200ms
+            m.lifetime.nanosec = 200000000
             ma.markers.append(m)
 
         self.marker_pub.publish(ma)
