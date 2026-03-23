@@ -15,9 +15,17 @@ find_package(std_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(wujihand_msgs REQUIRED)
 
-# Find wujihandcpp
-# Set WUJIHANDPY_SOURCE_DIR env var to use source build, otherwise uses system install
-if(DEFINED ENV{WUJIHANDPY_SOURCE_DIR})
+# Find wujihandcpp - check local bundled libs first, then env var, then system
+set(LOCAL_LIB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/lib")
+set(LOCAL_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/wujihandcpp_include")
+
+if(EXISTS "${LOCAL_LIB_DIR}/libwujihandcpp.a")
+    # Use bundled libraries (preferred)
+    set(WUJIHANDCPP_INCLUDE_DIR "${LOCAL_INCLUDE_DIR}")
+    set(WUJIHANDCPP_LIBRARY "${LOCAL_LIB_DIR}/libwujihandcpp.a")
+    set(WUJIHANDCPP_SPDLOG_LIBRARY "${LOCAL_LIB_DIR}/libspdlog.a")
+    message(STATUS "Using bundled wujihandcpp from: ${LOCAL_LIB_DIR}")
+elseif(DEFINED ENV{WUJIHANDPY_SOURCE_DIR})
     set(WUJIHANDPY_DIR "$ENV{WUJIHANDPY_SOURCE_DIR}")
     set(WUJIHANDCPP_INCLUDE_DIR "${WUJIHANDPY_DIR}/wujihandcpp/include")
     set(WUJIHANDCPP_LIBRARY "${WUJIHANDPY_DIR}/build/wujihandcpp/libwujihandcpp.a")
@@ -31,11 +39,11 @@ else()
 endif()
 
 if(NOT WUJIHANDCPP_LIBRARY OR NOT WUJIHANDCPP_INCLUDE_DIR)
-    message(FATAL_ERROR "wujihandcpp not found. Please install the wujihandcpp deb package or build wujihandpy first.")
+    message(FATAL_ERROR "wujihandcpp not found. Place libs in ${LOCAL_LIB_DIR} or set WUJIHANDPY_SOURCE_DIR.")
 endif()
 
 if(NOT WUJIHANDCPP_SPDLOG_LIBRARY)
-    message(FATAL_ERROR "spdlog not found. Please install libspdlog-dev or build wujihandpy first.")
+    message(FATAL_ERROR "spdlog not found. Place libspdlog.a in ${LOCAL_LIB_DIR}.")
 endif()
 
 find_package(Threads REQUIRED)

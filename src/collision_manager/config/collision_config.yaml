@@ -1,0 +1,104 @@
+# Collision Manager Configuration
+# Capsule geometry from Franka FR3 official URDF (franka_arm.xacro)
+# + Wuji Hand simplified capsules
+
+# Control frequency
+check_rate_hz: 100.0
+
+# Safety margin (meters) - added to all collision geometries
+safety_margin: 0.03  # 3cm (matches Franka default safety_distance)
+
+# Dual-arm setup
+dual_arm:
+  spacing: 0.06  # 60mm between arm bases (along Y axis)
+  left_base_offset: [0.0, 0.03, 0.0]   # +30mm Y
+  right_base_offset: [0.0, -0.03, 0.0]  # -30mm Y
+
+# FR3 kinematics (from fr3/kinematics.yaml)
+fr3_kinematics:
+  joint1: {x: 0, y: 0, z: 0.333, roll: 0, pitch: 0, yaw: 0}
+  joint2: {x: 0, y: 0, z: 0, roll: -1.5708, pitch: 0, yaw: 0}
+  joint3: {x: 0, y: -0.316, z: 0, roll: 1.5708, pitch: 0, yaw: 0}
+  joint4: {x: 0.0825, y: 0, z: 0, roll: 1.5708, pitch: 0, yaw: 0}
+  joint5: {x: -0.0825, y: 0.384, z: 0, roll: -1.5708, pitch: 0, yaw: 0}
+  joint6: {x: 0, y: 0, z: 0, roll: 1.5708, pitch: 0, yaw: 0}
+  joint7: {x: 0.088, y: 0, z: 0, roll: 1.5708, pitch: 0, yaw: 0}
+  flange: {x: 0, y: 0, z: 0.107, roll: 0, pitch: 0, yaw: 0}
+
+# FR3 joint limits (from fr3/joint_limits.yaml)
+fr3_joint_limits:
+  joint1: {lower: -2.9007, upper: 2.9007}
+  joint2: {lower: -1.8361, upper: 1.8361}
+  joint3: {lower: -2.9007, upper: 2.9007}
+  joint4: {lower: -3.0770, upper: -0.1169}
+  joint5: {lower: -2.8763, upper: 2.8763}
+  joint6: {lower: 0.4398, upper: 4.6216}
+  joint7: {lower: -3.0508, upper: 3.0508}
+
+# Capsule geometry from official Franka URDF (franka_arm.xacro)
+# Format: {radius, length, offset_xyz, direction}
+# radius does NOT include safety_margin (added at runtime)
+franka_capsules:
+  # link0: base
+  link0:
+    - {radius: 0.06, length: 0.03, xyz: [-0.075, 0, 0.06], direction: x}
+  # link1
+  link1:
+    - {radius: 0.06, length: 0.283, xyz: [0, 0, -0.1915], direction: z}
+  # link2
+  link2:
+    - {radius: 0.06, length: 0.12, xyz: [0, 0, 0], direction: z}
+  # link3
+  link3:
+    - {radius: 0.06, length: 0.15, xyz: [0, 0, -0.145], direction: z}
+  # link4
+  link4:
+    - {radius: 0.06, length: 0.12, xyz: [0, 0, 0], direction: z}
+  # link5
+  link5:
+    - {radius: 0.06, length: 0.10, xyz: [0, 0, -0.26], direction: z}
+    - {radius: 0.025, length: 0.14, xyz: [0, 0.08, -0.13], direction: z}
+  # link6
+  link6:
+    - {radius: 0.05, length: 0.08, xyz: [0, 0, -0.03], direction: z}
+  # link7
+  link7:
+    - {radius: 0.04, length: 0.14, xyz: [0, 0, 0.01], direction: z}
+    - {radius: 0.03, length: 0.01, xyz: [0.06, 0, 0.082], direction: x}
+
+# Wuji Hand simplified capsules
+wuji_hand_capsules:
+  palm: {radius: 0.04, length: 0.08}
+  thumb: {radius: 0.012, length: 0.06}
+  index: {radius: 0.010, length: 0.08}
+  middle: {radius: 0.010, length: 0.08}
+  ring: {radius: 0.010, length: 0.08}
+  pinky: {radius: 0.008, length: 0.07}
+
+# Environment collision objects
+environment:
+  table:
+    type: box
+    size: [1.2, 0.8, 0.02]       # 1.2m x 0.8m table surface
+    position: [0.5, 0.0, -0.01]   # slightly below arm base
+
+# Collision pairs to check
+collision_pairs: "all"
+
+# Pairs to exclude (adjacent links on same arm - can never collide)
+exclude_pairs:
+  - ["link0", "link1"]
+  - ["link1", "link2"]
+  - ["link2", "link3"]
+  - ["link3", "link4"]
+  - ["link4", "link5"]
+  - ["link5", "link6"]
+  - ["link6", "link7"]
+  - ["link7", "hand"]
+  - ["hand", "palm"]
+
+# Safe projection parameters
+safe_projection:
+  method: "binary_search"
+  max_iterations: 10
+  step_back_ratio: 0.1
