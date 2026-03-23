@@ -1,0 +1,73 @@
+# ROS2 colcon build artifacts
+build/
+install/
+log/
+*.bag
+*.db3
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+*.egg-info/
+*.egg-link
+dist/
+*.egg
+.pytest_cache/
+.coverage
+htmlcov/
+
+# C/C++ compiled objects
+*.o
+*.a
+*.so
+# Exception: keep SDK library files
+!**/ManusSDK/lib/*.so
+
+# wujihandpy C++ build (source build for wujihandcpp)
+src/wujihandpy/build/
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv
+.conda/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter Notebooks
+.ipynb_checkpoints
+
+# Logs
+*.log
+.wuji/
+
+# Temporary files
+*.tmp
+*.bak
+
+# ROS2 bag lock files
+*.yaml.lock
+
+# Secrets / credentials
+.env
+*.key
+
+# Backup project
+wuji-hand-teleop-backup/
+
+# Old files
+INTEGRATION_PLAN.md
+MoPA_v3.md
+franka_teleop-master/

@@ -1,0 +1,23 @@
+.vscode/
+.cache/
+
+.venv/
+
+build/
+package-build/
+wheelhouse/
+dist/
+_build/
+_generate/
+*.so
+*.py[cod]
+*.egg-info
+*env*
+
+compile_commands.json
+
+src/wujihandpy/_version.py
+
+# Claude-mem generated files (keep root CLAUDE.md)
+**/CLAUDE.md
+!/CLAUDE.md
