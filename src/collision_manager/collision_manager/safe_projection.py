@@ -11,7 +11,7 @@ from typing import Optional
 import numpy as np
 from scipy.spatial.transform import Rotation as R, Slerp
 
-from .collision_checker import CollisionChecker
+from .mesh_collision_checker import MeshCollisionChecker as CollisionChecker
 
 
 class SafeProjector:
