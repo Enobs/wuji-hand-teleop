@@ -89,7 +89,7 @@ def generate_launch_description():
             "rate_hz": 100.0,
             "dt": 0.01,
             "pos_cost": 1.0,
-            "ori_cost": 0.01,
+            "ori_cost": 0.5,
             "solver": "quadprog",
         }],
     )

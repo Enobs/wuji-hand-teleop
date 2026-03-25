@@ -37,11 +37,13 @@ from pico_input.data_source.live_data_source import LiveDataSource
 from pico_input.data_source.base import TrackerData
 from franka_ik.webxr_data_source import WebXRDataSource
 
-# WebXR → Franka world rotation
+# PICO WebXR → Franka world rotation
+# PICO: X=forward, Y=right, Z=up
+# Franka: X=forward, Y=left, Z=up
 _R_PICO2WORLD = np.array([
-    [ 0,  0, -1],   # Franka_X = -WebXR_Z
-    [-1,  0,  0],   # Franka_Y = -WebXR_X
-    [ 0,  1,  0],   # Franka_Z =  WebXR_Y
+    [ 1,  0,  0],   # Franka_X = +PICO_X (forward)
+    [ 0,  1,  0],   # Franka_Y = +PICO_Y
+    [ 0,  0,  1],   # Franka_Z = +PICO_Z (up)
 ], dtype=np.float64)
 
 
@@ -114,9 +116,14 @@ class FrankaPicoInputNode(Node):
         self.get_logger().info(
             f"Data source '{src_type}' {'ready' if ok else 'FAILED'}")
 
+        # Home EE orientation (from FK at home joints, qx,qy,qz,qw)
+        self._home_quat = np.array([0.9240, -0.3825, 0.0, 0.0])
+
         # Calibration state
         self._calib_left_pico: Optional[np.ndarray] = None
         self._calib_right_pico: Optional[np.ndarray] = None
+        self._calib_left_rot: Optional[R] = None   # pico rotation at calibration
+        self._calib_right_rot: Optional[R] = None
         self._calibrated = False
         self._paused = False
         self._calib_time = time.monotonic() + self._delay
@@ -169,6 +176,8 @@ class FrankaPicoInputNode(Node):
     def _calibrate(self, left_t, right_t):
         self._calib_left_pico = left_t.position.copy()
         self._calib_right_pico = right_t.position.copy()
+        self._calib_left_rot = R.from_quat(left_t.orientation)
+        self._calib_right_rot = R.from_quat(right_t.orientation)
         self._calibrated = True
         self.get_logger().info(
             f"CALIBRATED — left_pico={self._calib_left_pico.round(3)}, "
@@ -216,18 +225,23 @@ class FrankaPicoInputNode(Node):
 
         stamp = self.get_clock().now().to_msg()
 
+        home_rot = R.from_quat(self._home_quat)
+
         if left_t is not None:
             delta_pico = left_t.position - self._calib_left_pico
             delta_world = self._scale * _transform_pos(delta_pico)
             pos_world = self._left_init + delta_world
-            quat_world = _transform_rot(left_t.orientation)
+            # Relative rotation: delta_rot = current @ calib_inv, then apply to home
+            delta_rot = R.from_quat(left_t.orientation) * self._calib_left_rot.inv()
+            quat_world = (delta_rot * home_rot).as_quat()
             self._left_pub.publish(_make_pose_msg(pos_world, quat_world, stamp))
 
         if right_t is not None:
             delta_pico = right_t.position - self._calib_right_pico
             delta_world = self._scale * _transform_pos(delta_pico)
             pos_world = self._right_init + delta_world
-            quat_world = _transform_rot(right_t.orientation)
+            delta_rot = R.from_quat(right_t.orientation) * self._calib_right_rot.inv()
+            quat_world = (delta_rot * home_rot).as_quat()
             self._right_pub.publish(_make_pose_msg(pos_world, quat_world, stamp))
 
         # Debug: print delta every ~1s
