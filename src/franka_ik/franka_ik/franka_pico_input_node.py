@@ -1,35 +1,24 @@
 """
-Franka PICO Input Node
+Franka PICO Input Node (WebXR + recorded + live)
 
-Reads PICO tracker data and publishes world-frame PoseStamped targets for
-the franka_ik_node. No dependency on tianji_world_output.
+Calibration:
+  - Auto-calibrate after startup delay
+  - Press BOTH triggers simultaneously to re-calibrate anytime
+  - Press grip (button 1) to toggle pause/resume
 
-Coordinate transform (PICO → Franka world):
-  Robot_X = -PICO_Z   (forward)
-  Robot_Y = -PICO_X   (left)
-  Robot_Z =  PICO_Y   (up)
+Control:
+  target_world = init_ee + scale * R_pico2world @ (pico_current - pico_calib)
 
-Control flow:
-  1. Data source initializes (recorded file or live PICO SDK)
-  2. After auto_init_delay seconds, record calibration positions
-  3. Each cycle: target_world = init_ee_world + R @ (pico_pos - calib_pico_pos)
-  4. Orientation: transform PICO tracker quaternion into world frame
+WebXR coordinate convention (OpenGL):
+  X=right, Y=up, Z=backward
 
-Subscribes: (none)
-Publishes:
-  /left_arm_target_pose   (geometry_msgs/PoseStamped)
-  /right_arm_target_pose  (geometry_msgs/PoseStamped)
+Franka world:
+  X=forward, Y=left, Z=up
 
-Parameters:
-  data_source_type       "live" | "recorded"
-  recorded_file_path     path to .txt recording
-  playback_speed         float (default 1.0)
-  auto_init_delay        seconds before calibration (default 3.0)
-  publish_rate           Hz (default 90.0)
-  left_init_pos          [x, y, z] world frame (default [0.3, 0.3, 0.5])
-  right_init_pos         [x, y, z] world frame (default [0.3,-0.3, 0.5])
-  tracker_serial_left    serial suffix for left wrist  (default "190058")
-  tracker_serial_right   serial suffix for right wrist (default "190600")
+Transform:
+  Franka_X = -WebXR_Z
+  Franka_Y = -WebXR_X
+  Franka_Z =  WebXR_Y
 """
 from __future__ import annotations
 
@@ -43,37 +32,30 @@ import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped
 
-# PICO data-source abstraction (no tianji dependency)
 from pico_input.data_source.recorded_data_source import RecordedDataSource
 from pico_input.data_source.live_data_source import LiveDataSource
-from pico_input.data_source.base import DataSource, TrackerData
+from pico_input.data_source.base import TrackerData
+from franka_ik.webxr_data_source import WebXRDataSource
 
-
-# PICO → Franka-world rotation matrix
-# Robot_X = -PICO_Z, Robot_Y = -PICO_X, Robot_Z = PICO_Y
+# WebXR → Franka world rotation
 _R_PICO2WORLD = np.array([
-    [ 0,  0, -1],
-    [-1,  0,  0],
-    [ 0,  1,  0],
+    [ 0,  0, -1],   # Franka_X = -WebXR_Z
+    [-1,  0,  0],   # Franka_Y = -WebXR_X
+    [ 0,  1,  0],   # Franka_Z =  WebXR_Y
 ], dtype=np.float64)
 
 
-def _transform_pos(pico_pos: np.ndarray) -> np.ndarray:
-    """Transform position vector from PICO frame to world frame."""
-    return _R_PICO2WORLD @ pico_pos
+def _transform_pos(pico_delta: np.ndarray) -> np.ndarray:
+    return _R_PICO2WORLD @ pico_delta
 
 
 def _transform_rot(pico_quat: np.ndarray) -> np.ndarray:
-    """
-    Transform quaternion from PICO frame to world frame.
-    Returns quaternion [qx, qy, qz, qw].
-    """
     R_tracker = R.from_quat(pico_quat).as_matrix()
     R_world = _R_PICO2WORLD @ R_tracker @ _R_PICO2WORLD.T
     return R.from_matrix(R_world).as_quat()
 
 
-def _make_pose_msg(pos: np.ndarray, quat: np.ndarray, stamp, frame: str) -> PoseStamped:
+def _make_pose_msg(pos, quat, stamp, frame="world"):
     msg = PoseStamped()
     msg.header.stamp = stamp
     msg.header.frame_id = frame
@@ -92,73 +74,105 @@ class FrankaPicoInputNode(Node):
     def __init__(self):
         super().__init__("franka_pico_input_node")
 
-        self.declare_parameter("data_source_type",    "live")
-        self.declare_parameter("recorded_file_path",  "")
-        self.declare_parameter("playback_speed",      1.0)
-        self.declare_parameter("auto_init_delay",     3.0)
-        self.declare_parameter("publish_rate",        90.0)
-        self.declare_parameter("left_init_pos",  [0.3,  0.3, 0.5])
-        self.declare_parameter("right_init_pos", [0.3, -0.3, 0.5])
-        self.declare_parameter("tracker_serial_left",  "190058")
+        # Parameters
+        self.declare_parameter("data_source_type", "live")
+        self.declare_parameter("recorded_file_path", "")
+        self.declare_parameter("playback_speed", 1.0)
+        self.declare_parameter("auto_init_delay", 3.0)
+        self.declare_parameter("publish_rate", 90.0)
+        self.declare_parameter("left_init_pos",  [0.307,  0.3, 0.590])
+        self.declare_parameter("right_init_pos", [0.307, -0.3, 0.590])
+        self.declare_parameter("scale", 1.0)
+        self.declare_parameter("tracker_serial_left", "190058")
         self.declare_parameter("tracker_serial_right", "190600")
 
-        src_type     = self.get_parameter("data_source_type").value
-        file_path    = self.get_parameter("recorded_file_path").value
-        speed        = self.get_parameter("playback_speed").value
-        self._delay  = self.get_parameter("auto_init_delay").value
-        rate_hz      = self.get_parameter("publish_rate").value
-        self._left_init  = np.array(self.get_parameter("left_init_pos").value,  dtype=np.float64)
+        src_type  = self.get_parameter("data_source_type").value
+        file_path = self.get_parameter("recorded_file_path").value
+        speed     = self.get_parameter("playback_speed").value
+        self._delay    = self.get_parameter("auto_init_delay").value
+        rate_hz        = self.get_parameter("publish_rate").value
+        self._left_init  = np.array(self.get_parameter("left_init_pos").value, dtype=np.float64)
         self._right_init = np.array(self.get_parameter("right_init_pos").value, dtype=np.float64)
+        self._scale      = self.get_parameter("scale").value
         self._sn_left    = self.get_parameter("tracker_serial_left").value
         self._sn_right   = self.get_parameter("tracker_serial_right").value
 
-        # ── data source ────────────────────────────────────────────────
-        self._source: DataSource
+        self._src_type = src_type
+        if src_type == "webxr":
+            self._sn_left = "WEBXR_LEFT"
+            self._sn_right = "WEBXR_RIGHT"
+
+        # Data source
         if src_type == "recorded":
             self._source = RecordedDataSource(file_path, playback_speed=speed, loop=True)
+        elif src_type == "webxr":
+            self._source = WebXRDataSource()
         else:
             self._source = LiveDataSource()
 
         ok = self._source.initialize()
-        if not ok:
-            self.get_logger().error(
-                f"Data source '{src_type}' failed to initialize "
-                f"(file='{file_path}'). Node will keep retrying.")
-        else:
-            self.get_logger().info(f"Data source '{src_type}' ready")
-
-        # ── calibration state ──────────────────────────────────────────
-        self._calib_time: Optional[float] = None   # when to calibrate
-        self._calib_left_pico:  Optional[np.ndarray] = None
-        self._calib_right_pico: Optional[np.ndarray] = None
-        self._calib_left_rot:   Optional[np.ndarray] = None  # world-frame quat at calib
-        self._calib_right_rot:  Optional[np.ndarray] = None
-        self._calibrated = False
-
-        # Start calibration countdown immediately
-        self._calib_time = time.monotonic() + self._delay
         self.get_logger().info(
-            f"Calibration in {self._delay:.1f}s — hold wrists at natural pose")
+            f"Data source '{src_type}' {'ready' if ok else 'FAILED'}")
 
-        # ── publishers ─────────────────────────────────────────────────
-        self._left_pub  = self.create_publisher(PoseStamped, "/left_arm_target_pose",  10)
+        # Calibration state
+        self._calib_left_pico: Optional[np.ndarray] = None
+        self._calib_right_pico: Optional[np.ndarray] = None
+        self._calibrated = False
+        self._paused = False
+        self._calib_time = time.monotonic() + self._delay
+        self._prev_both_triggers = False
+
+        # Debug: track axis movement
+        self._debug_counter = 0
+
+        # Publishers
+        self._left_pub = self.create_publisher(PoseStamped, "/left_arm_target_pose", 10)
         self._right_pub = self.create_publisher(PoseStamped, "/right_arm_target_pose", 10)
 
         self.create_timer(1.0 / rate_hz, self._loop)
         self.get_logger().info(
-            f"FrankaPicoInputNode ready — {rate_hz}Hz, source={src_type}, "
-            f"left_sn=*{self._sn_left}, right_sn=*{self._sn_right}")
+            f"Ready — {rate_hz}Hz, scale={self._scale}, "
+            f"init_L={self._left_init.tolist()}, init_R={self._right_init.tolist()}")
+        self.get_logger().info(
+            f"Controls: BOTH TRIGGERS = calibrate, GRIP = pause/resume")
 
-    # ── helpers ────────────────────────────────────────────────────────
-
-    def _find_tracker(self, trackers: list[TrackerData], suffix: str) -> Optional[TrackerData]:
-        """Return first tracker whose serial number ends with suffix."""
+    def _find_tracker(self, trackers, suffix):
         for t in trackers:
             if t.serial_number.endswith(suffix) and t.is_valid:
                 return t
         return None
 
-    # ── main loop ──────────────────────────────────────────────────────
+    def _check_buttons(self):
+        """Check for trigger/grip presses. Returns (both_triggers_pressed, grip_toggled)."""
+        if not isinstance(self._source, WebXRDataSource):
+            return False, False
+
+        buttons = self._source.get_buttons()
+        lb = buttons.get("left", [])
+        rb = buttons.get("right", [])
+
+        # Button 0 = trigger, Button 1 = grip
+        left_trigger = len(lb) > 0 and lb[0].get("pressed", False)
+        right_trigger = len(rb) > 0 and rb[0].get("pressed", False)
+        both_triggers = left_trigger and right_trigger
+
+        # Detect rising edge for trigger
+        trigger_edge = both_triggers and not self._prev_both_triggers
+        self._prev_both_triggers = both_triggers
+
+        # Grip toggle (either hand)
+        left_grip = len(lb) > 1 and lb[1].get("pressed", False)
+        right_grip = len(rb) > 1 and rb[1].get("pressed", False)
+
+        return trigger_edge, (left_grip or right_grip)
+
+    def _calibrate(self, left_t, right_t):
+        self._calib_left_pico = left_t.position.copy()
+        self._calib_right_pico = right_t.position.copy()
+        self._calibrated = True
+        self.get_logger().info(
+            f"CALIBRATED — left_pico={self._calib_left_pico.round(3)}, "
+            f"right_pico={self._calib_right_pico.round(3)}")
 
     def _loop(self):
         if not self._source.is_available():
@@ -168,47 +182,64 @@ class FrankaPicoInputNode(Node):
         if not trackers:
             return
 
-        left_t  = self._find_tracker(trackers, self._sn_left)
+        left_t = self._find_tracker(trackers, self._sn_left)
         right_t = self._find_tracker(trackers, self._sn_right)
 
-        # ── calibration ────────────────────────────────────────────────
-        now = time.monotonic()
-        if not self._calibrated and self._calib_time is not None and now >= self._calib_time:
-            if left_t is not None and right_t is not None:
-                self._calib_left_pico  = left_t.position.copy()
-                self._calib_right_pico = right_t.position.copy()
-                self._calib_left_rot   = _transform_rot(left_t.orientation)
-                self._calib_right_rot  = _transform_rot(right_t.orientation)
-                self._calibrated = True
-                self.get_logger().info(
-                    f"Calibrated — left_pico={self._calib_left_pico}, "
-                    f"right_pico={self._calib_right_pico}")
-            else:
-                # Retry in 0.5s if trackers not yet visible
-                self._calib_time = now + 0.5
-                self.get_logger().warn(
-                    "Calibration: waiting for both wrist trackers…",
-                    throttle_duration_sec=2.0)
+        # Button checks
+        trigger_pressed, grip_pressed = self._check_buttons()
+
+        if trigger_pressed and left_t and right_t:
+            self._calibrate(left_t, right_t)
             return
 
+        if grip_pressed:
+            self._paused = not self._paused
+            self.get_logger().info(f"{'PAUSED' if self._paused else 'RESUMED'}")
+            time.sleep(0.3)  # debounce
+            return
+
+        # Auto calibration on startup
         if not self._calibrated:
+            now = time.monotonic()
+            if self._calib_time and now >= self._calib_time:
+                if left_t and right_t:
+                    self._calibrate(left_t, right_t)
+                else:
+                    self._calib_time = now + 0.5
+                    self.get_logger().warn(
+                        "Waiting for both controllers...",
+                        throttle_duration_sec=2.0)
+            return
+
+        if self._paused:
             return
 
         stamp = self.get_clock().now().to_msg()
 
         if left_t is not None:
-            delta_world = _transform_pos(left_t.position - self._calib_left_pico)
-            pos_world   = self._left_init + delta_world
-            quat_world  = _transform_rot(left_t.orientation)
-            self._left_pub.publish(
-                _make_pose_msg(pos_world, quat_world, stamp, "world"))
+            delta_pico = left_t.position - self._calib_left_pico
+            delta_world = self._scale * _transform_pos(delta_pico)
+            pos_world = self._left_init + delta_world
+            quat_world = _transform_rot(left_t.orientation)
+            self._left_pub.publish(_make_pose_msg(pos_world, quat_world, stamp))
 
         if right_t is not None:
-            delta_world = _transform_pos(right_t.position - self._calib_right_pico)
-            pos_world   = self._right_init + delta_world
-            quat_world  = _transform_rot(right_t.orientation)
-            self._right_pub.publish(
-                _make_pose_msg(pos_world, quat_world, stamp, "world"))
+            delta_pico = right_t.position - self._calib_right_pico
+            delta_world = self._scale * _transform_pos(delta_pico)
+            pos_world = self._right_init + delta_world
+            quat_world = _transform_rot(right_t.orientation)
+            self._right_pub.publish(_make_pose_msg(pos_world, quat_world, stamp))
+
+        # Debug: print delta every ~1s
+        self._debug_counter += 1
+        if self._debug_counter % 90 == 0 and right_t is not None:
+            dp = right_t.position - self._calib_right_pico
+            dw = self._scale * _transform_pos(dp)
+            self.get_logger().info(
+                f"R delta_pico=[{dp[0]:+.3f},{dp[1]:+.3f},{dp[2]:+.3f}] "
+                f"delta_world=[{dw[0]:+.3f},{dw[1]:+.3f},{dw[2]:+.3f}] "
+                f"target={np.round(self._right_init + dw, 3).tolist()}",
+                throttle_duration_sec=1.0)
 
     def destroy_node(self):
         self._source.close()

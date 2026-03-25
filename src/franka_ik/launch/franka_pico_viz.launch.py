@@ -19,6 +19,7 @@ from pathlib import Path
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
+from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
@@ -35,7 +36,10 @@ def generate_launch_description():
     # ---------- launch args ----------
     data_source_arg = DeclareLaunchArgument(
         "data_source_type", default_value="live",
-        description="'live' (real PICO) or 'recorded' (replay)")
+        description="'live' (real PICO) | 'recorded' (replay) | 'webxr' (PICO WebXR) | 'none' (no input)")
+    enable_input_arg = DeclareLaunchArgument(
+        "enable_input", default_value="true",
+        description="Set 'false' to disable pico input node (for testing)")
     recorded_file_arg = DeclareLaunchArgument(
         "recorded_file_path",
         default_value=str(
@@ -60,6 +64,7 @@ def generate_launch_description():
         package="franka_ik",
         executable="franka_pico_input_node",
         name="franka_pico_input_node",
+        condition=IfCondition(LaunchConfiguration("enable_input")),
         output="screen",
         emulate_tty=True,
         parameters=[{
@@ -68,8 +73,8 @@ def generate_launch_description():
             "playback_speed":     LaunchConfiguration("playback_speed"),
             "auto_init_delay":    3.0,
             "publish_rate":       90.0,
-            "left_init_pos":      [0.3,  0.3, 0.5],
-            "right_init_pos":     [0.3, -0.3, 0.5],
+            "left_init_pos":      [0.307,  0.3, 0.590],
+            "right_init_pos":     [0.307, -0.3, 0.590],
             "tracker_serial_left":  "190058G",
             "tracker_serial_right": "190600G",
         }],
@@ -84,7 +89,7 @@ def generate_launch_description():
             "rate_hz": 100.0,
             "dt": 0.01,
             "pos_cost": 1.0,
-            "ori_cost": 0.5,
+            "ori_cost": 0.01,
             "solver": "quadprog",
         }],
     )
@@ -99,6 +104,7 @@ def generate_launch_description():
 
     return LaunchDescription([
         data_source_arg,
+        enable_input_arg,
         recorded_file_arg,
         playback_speed_arg,
         robot_state_publisher,

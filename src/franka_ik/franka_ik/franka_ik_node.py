@@ -140,7 +140,7 @@ class FrankaIKNode(Node):
             LEFT_EE_FRAME,  position_cost=pos_cost, orientation_cost=ori_cost)
         self._right_task = pink.tasks.FrameTask(
             RIGHT_EE_FRAME, position_cost=pos_cost, orientation_cost=ori_cost)
-        self._posture_task = pink.tasks.PostureTask(cost=1e-3)
+        self._posture_task = pink.tasks.PostureTask(cost=0.1)
         self._posture_task.set_target(q0)
 
         self._configuration.update()
@@ -220,7 +220,11 @@ class FrankaIKNode(Node):
             self.get_logger().warn(f"IK failed: {e}", throttle_duration_sec=2.0)
             return
 
-        # 2. Candidate q
+        # 2. Clamp joint velocities for smooth motion
+        max_vel = 2.0  # rad/s — FR3 safe limit
+        velocity = np.clip(velocity, -max_vel, max_vel)
+
+        # 3. Candidate q
         q_next = pin.integrate(self._model, self._configuration.q, velocity * self._dt)
 
         # 3. Collision check + safe projection
@@ -243,6 +247,7 @@ class FrankaIKNode(Node):
 
         # 4. Accept q_next
         self._configuration.q = q_next
+        self._configuration.update()
         pin.forwardKinematics(self._model, self._data, q_next)
 
         # 5. Publish
