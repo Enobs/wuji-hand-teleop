@@ -18,6 +18,8 @@ setup(
         'console_scripts': [
             'franka_ik_node = franka_ik.franka_ik_node:main',
             'franka_pico_input_node = franka_ik.franka_pico_input_node:main',
+            'franka_output_node = franka_ik.franka_output_node:main',
+            'franka_state_publisher = franka_ik.franka_state_publisher:main',
         ],
     },
 )
