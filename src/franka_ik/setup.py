@@ -9,7 +9,11 @@ setup(
     data_files=[
         ('share/ament_index/resource_index/packages', ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
-        ('share/' + package_name + '/launch', ['launch/franka_pico_viz.launch.py']),
+        ('share/' + package_name + '/launch', [
+            'launch/franka_pico_viz.launch.py',
+            'launch/franka_pico_sim.launch.py',
+            'launch/franka_pico_real.launch.py',
+        ]),
         ('share/' + package_name + '/rviz', ['rviz/franka_pico.rviz']),
     ],
     install_requires=['setuptools'],

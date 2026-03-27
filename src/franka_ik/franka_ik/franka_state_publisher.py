@@ -23,7 +23,7 @@ from rclpy.node import Node
 from sensor_msgs.msg import JointState
 
 try:
-    from franky import Robot
+    from franky import Robot, RealtimeConfig
     HAS_FRANKY = True
 except ImportError:
     HAS_FRANKY = False
@@ -62,14 +62,14 @@ class FrankaStatePublisher(Node):
 
         if enable_left:
             try:
-                self._left_robot = Robot(left_ip)
+                self._left_robot = Robot(left_ip, realtime_config=RealtimeConfig.Ignore)
                 self.get_logger().info(f"LEFT  arm connected: {left_ip}")
             except Exception as e:
                 self.get_logger().error(f"LEFT  arm failed ({left_ip}): {e}")
 
         if enable_right:
             try:
-                self._right_robot = Robot(right_ip)
+                self._right_robot = Robot(right_ip, realtime_config=RealtimeConfig.Ignore)
                 self.get_logger().info(f"RIGHT arm connected: {right_ip}")
             except Exception as e:
                 self.get_logger().error(f"RIGHT arm failed ({right_ip}): {e}")
@@ -80,9 +80,9 @@ class FrankaStatePublisher(Node):
             f"Publishing real joint states to {topic} at {rate_hz}Hz")
 
     def _loop(self):
-        left_q = list(self._left_robot.current_joint_position) \
+        left_q = list(self._left_robot.current_joint_positions) \
             if self._left_robot else FR3_HOME
-        right_q = list(self._right_robot.current_joint_position) \
+        right_q = list(self._right_robot.current_joint_positions) \
             if self._right_robot else FR3_HOME
 
         msg = JointState()
